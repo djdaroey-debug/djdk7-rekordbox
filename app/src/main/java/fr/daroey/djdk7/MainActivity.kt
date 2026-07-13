@@ -4,6 +4,7 @@ import android.content.Context
 import android.content.Intent
 import android.net.Uri
 import android.os.Bundle
+import android.os.ParcelFileDescriptor
 import android.provider.DocumentsContract
 import android.webkit.JavascriptInterface
 import android.webkit.WebResourceRequest
@@ -19,6 +20,7 @@ import androidx.documentfile.provider.DocumentFile
 import org.json.JSONArray
 import org.json.JSONObject
 import java.io.ByteArrayInputStream
+import java.io.FileInputStream
 import java.io.FilterInputStream
 import java.io.InputStream
 
@@ -217,19 +219,21 @@ class MainActivity : AppCompatActivity() {
                 val start = m.groupValues[1].toLong()
                 val end = if (m.groupValues[2].isNotEmpty()) m.groupValues[2].toLong() else total - 1
                 val len = (end - start + 1).coerceAtLeast(0)
-                val base = contentResolver.openInputStream(uri)
+                val pfd = contentResolver.openFileDescriptor(uri, "r")
                     ?: return resp("text/plain", 404, "NF", ByteArrayInputStream(ByteArray(0)), null)
-                skipFully(base, start)
-                val limited = LimitedInputStream(base, len)
+                val ins = ParcelFileDescriptor.AutoCloseInputStream(pfd)
+                try { ins.channel.position(start) } catch (_: Exception) {}
+                val limited = LimitedInputStream(ins, len)
                 headers["Content-Range"] = "bytes $start-$end/$total"
                 headers["Content-Length"] = len.toString()
                 return resp(mime, 206, "Partial Content", limited, headers)
             }
         }
-        val stream = contentResolver.openInputStream(uri)
+        val pfd = contentResolver.openFileDescriptor(uri, "r")
             ?: return resp("text/plain", 404, "NF", ByteArrayInputStream(ByteArray(0)), null)
+        val ins = ParcelFileDescriptor.AutoCloseInputStream(pfd)
         if (total > 0) headers["Content-Length"] = total.toString()
-        return resp(mime, 200, "OK", stream, headers)
+        return resp(mime, 200, "OK", ins, headers)
     }
 
     private fun fileSize(uri: Uri): Long {
@@ -240,17 +244,6 @@ class MainActivity : AppCompatActivity() {
         } catch (_: Exception) { -1L }
     }
 
-    private fun skipFully(s: InputStream, n: Long) {
-        var left = n
-        val buf = ByteArray(64 * 1024)
-        while (left > 0) {
-            val skipped = s.skip(left)
-            if (skipped > 0) { left -= skipped; continue }
-            val r = s.read(buf, 0, minOf(buf.size.toLong(), left).toInt())
-            if (r < 0) break
-            left -= r
-        }
-    }
 
     private fun resp(mime: String, code: Int, reason: String, data: InputStream, headers: Map<String, String>?): WebResourceResponse {
         val r = WebResourceResponse(mime, "UTF-8", data)
