@@ -1,7 +1,7 @@
 package fr.daroey.djdk7
 
-import android.app.Activity
 import android.content.Context
+import android.content.Intent
 import android.net.Uri
 import android.os.Bundle
 import android.provider.DocumentsContract
@@ -11,9 +11,11 @@ import android.webkit.WebResourceResponse
 import android.webkit.WebSettings
 import android.webkit.WebView
 import android.webkit.WebViewClient
+import android.widget.Toast
 import androidx.activity.result.ActivityResultLauncher
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AppCompatActivity
+import androidx.documentfile.provider.DocumentFile
 import org.json.JSONArray
 import org.json.JSONObject
 import java.io.ByteArrayInputStream
@@ -22,19 +24,22 @@ import java.io.InputStream
 
 /**
  * DJ DK7 — lecteur Rekordbox.
- * La page web (assets/index.html) est servie sous https://dk7.local et lit la carte via
- *   /card/list           -> liste JSON des fichiers
+ *
+ * La carte est lue via un ou plusieurs dossiers autorisés (SAF). Sur certaines cartes SD,
+ * Android interdit de sélectionner la racine ; on choisit donc les dossiers un par un :
+ *   1) le dossier PIONEER (playlists)  2) le dossier Contents (musiques).
+ * Les autorisations sont mémorisées, les fichiers de tous les dossiers sont combinés.
+ *
+ * Les fichiers sont exposés à la page web sous https://dk7.local :
+ *   /card/list            -> liste JSON (chemins préfixés par le nom du dossier racine)
  *   /card/file/<chemin>   -> contenu du fichier (avec support Range pour le streaming audio)
- * L'accès à la carte se fait via le sélecteur de dossier Android (SAF), mémorisé.
  */
 class MainActivity : AppCompatActivity() {
 
     private lateinit var web: WebView
-    private var treeUri: Uri? = null
-    // cache: chemin relatif (minuscule) -> Uri du document
+    private val trees = ArrayList<Uri>()                 // dossiers autorisés (PIONEER, Contents, ...)
     private var fileCache: MutableMap<String, Uri>? = null
     private var fileList: MutableList<String>? = null
-
     private lateinit var pickTree: ActivityResultLauncher<Uri?>
 
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -43,23 +48,21 @@ class MainActivity : AppCompatActivity() {
         pickTree = registerForActivityResult(ActivityResultContracts.OpenDocumentTree()) { uri ->
             if (uri != null) {
                 try {
-                    contentResolver.takePersistableUriPermission(
-                        uri,
-                        android.content.Intent.FLAG_GRANT_READ_URI_PERMISSION
-                    )
+                    contentResolver.takePersistableUriPermission(uri, Intent.FLAG_GRANT_READ_URI_PERMISSION)
                 } catch (_: Exception) {}
-                getSharedPreferences("dk7", Context.MODE_PRIVATE).edit()
-                    .putString("tree", uri.toString()).apply()
-                treeUri = uri
+                addTree(uri)
+                saveTrees()
                 fileCache = null; fileList = null
+                val name = treeName(uri)
+                toast("Dossier « $name » ajouté")
+                if (name.equals("PIONEER", true) && trees.none { treeName(it).equals("Contents", true) }) {
+                    toast("Maintenant rappuie sur « Carte » et choisis le dossier Contents")
+                }
                 web.post { web.evaluateJavascript("window.onCardReady && window.onCardReady();", null) }
             }
         }
 
-        // restaure la carte mémorisée
-        getSharedPreferences("dk7", Context.MODE_PRIVATE).getString("tree", null)?.let {
-            treeUri = Uri.parse(it)
-        }
+        loadTrees()
 
         web = WebView(this)
         setContentView(web)
@@ -96,44 +99,82 @@ class MainActivity : AppCompatActivity() {
 
     inner class Bridge {
         @JavascriptInterface fun pickCard() { runOnUiThread { pickTree.launch(null) } }
-        @JavascriptInterface fun hasCard(): Boolean = treeUri != null
+        @JavascriptInterface fun hasCard(): Boolean = trees.isNotEmpty()
+        @JavascriptInterface fun resetCard() {
+            runOnUiThread {
+                trees.clear(); saveTrees(); fileCache = null; fileList = null
+                toast("Carte réinitialisée — rechoisis PIONEER puis Contents")
+                web.evaluateJavascript("window.onCardReady && window.onCardReady();", null)
+            }
+        }
     }
 
-    // --- service des fichiers ------------------------------------------------
+    // --- gestion des dossiers autorisés -------------------------------------
 
-    private fun asset(name: String, mime: String): WebResourceResponse {
-        val stream = assets.open(name)
-        return resp(mime, 200, "OK", stream, mapOf("Access-Control-Allow-Origin" to "*"))
+    private fun addTree(uri: Uri) {
+        if (trees.none { it.toString() == uri.toString() }) trees.add(uri)
     }
+
+    private fun treeName(uri: Uri): String =
+        try { DocumentFile.fromTreeUri(this, uri)?.name ?: "" } catch (_: Exception) { "" }
+
+    private fun saveTrees() {
+        getSharedPreferences("dk7", Context.MODE_PRIVATE).edit()
+            .putStringSet("trees", trees.map { it.toString() }.toSet()).apply()
+    }
+
+    private fun loadTrees() {
+        trees.clear()
+        getSharedPreferences("dk7", Context.MODE_PRIVATE)
+            .getStringSet("trees", emptySet())?.forEach { trees.add(Uri.parse(it)) }
+    }
+
+    private fun toast(m: String) = runOnUiThread { Toast.makeText(this, m, Toast.LENGTH_LONG).show() }
+
+    // --- construction de l'index des fichiers -------------------------------
 
     private fun buildCache() {
         val cache = HashMap<String, Uri>()
         val list = ArrayList<String>()
-        val tree = treeUri ?: run { fileCache = cache; fileList = list; return }
-        val rootId = DocumentsContract.getTreeDocumentId(tree)
-        fun recurse(docId: String, prefix: String) {
-            val children = DocumentsContract.buildChildDocumentsUriUsingTree(tree, docId)
-            contentResolver.query(
-                children,
-                arrayOf(
-                    DocumentsContract.Document.COLUMN_DOCUMENT_ID,
-                    DocumentsContract.Document.COLUMN_DISPLAY_NAME,
-                    DocumentsContract.Document.COLUMN_MIME_TYPE
-                ), null, null, null
-            )?.use { c ->
-                while (c.moveToNext()) {
-                    val id = c.getString(0); val name = c.getString(1); val mime = c.getString(2)
-                    val rel = if (prefix.isEmpty()) name else "$prefix/$name"
-                    if (mime == DocumentsContract.Document.MIME_TYPE_DIR) recurse(id, rel)
-                    else {
-                        list.add(rel)
-                        cache[rel.lowercase()] = DocumentsContract.buildDocumentUriUsingTree(tree, id)
-                    }
+        for (tree in trees) {
+            try {
+                val prefix = treeName(tree)                       // "PIONEER", "Contents", ...
+                val rootId = DocumentsContract.getTreeDocumentId(tree)
+                walk(tree, rootId, prefix, cache, list)
+            } catch (_: Exception) {}
+        }
+        fileCache = cache; fileList = list
+    }
+
+    private fun walk(tree: Uri, docId: String, prefix: String,
+                     cache: MutableMap<String, Uri>, list: MutableList<String>) {
+        val children = DocumentsContract.buildChildDocumentsUriUsingTree(tree, docId)
+        contentResolver.query(
+            children,
+            arrayOf(
+                DocumentsContract.Document.COLUMN_DOCUMENT_ID,
+                DocumentsContract.Document.COLUMN_DISPLAY_NAME,
+                DocumentsContract.Document.COLUMN_MIME_TYPE
+            ), null, null, null
+        )?.use { c ->
+            while (c.moveToNext()) {
+                val id = c.getString(0); val name = c.getString(1); val mime = c.getString(2)
+                val rel = if (prefix.isEmpty()) name else "$prefix/$name"
+                if (mime == DocumentsContract.Document.MIME_TYPE_DIR) {
+                    walk(tree, id, rel, cache, list)
+                } else {
+                    list.add(rel)
+                    cache[rel.lowercase()] = DocumentsContract.buildDocumentUriUsingTree(tree, id)
                 }
             }
         }
-        try { recurse(rootId, "") } catch (_: Exception) {}
-        fileCache = cache; fileList = list
+    }
+
+    // --- service HTTP simulé -------------------------------------------------
+
+    private fun asset(name: String, mime: String): WebResourceResponse {
+        val stream = assets.open(name)
+        return resp(mime, 200, "OK", stream, mapOf("Access-Control-Allow-Origin" to "*"))
     }
 
     private fun serveList(): WebResourceResponse {
@@ -176,7 +217,8 @@ class MainActivity : AppCompatActivity() {
                 val start = m.groupValues[1].toLong()
                 val end = if (m.groupValues[2].isNotEmpty()) m.groupValues[2].toLong() else total - 1
                 val len = (end - start + 1).coerceAtLeast(0)
-                val base = contentResolver.openInputStream(uri) ?: return resp("text/plain", 404, "NF", ByteArrayInputStream(ByteArray(0)), null)
+                val base = contentResolver.openInputStream(uri)
+                    ?: return resp("text/plain", 404, "NF", ByteArrayInputStream(ByteArray(0)), null)
                 skipFully(base, start)
                 val limited = LimitedInputStream(base, len)
                 headers["Content-Range"] = "bytes $start-$end/$total"
@@ -218,7 +260,6 @@ class MainActivity : AppCompatActivity() {
     }
 
     override fun onBackPressed() {
-        // ferme la page Paramètres si ouverte, sinon quitte
         web.evaluateJavascript(
             "(function(){var p=document.getElementById('setPage');var m=document.getElementById('modal');" +
             "if(m&&m.classList.contains('show')){m.classList.remove('show');return 'x';}" +
