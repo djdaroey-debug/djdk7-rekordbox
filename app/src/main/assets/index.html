@@ -123,7 +123,6 @@ input[type=file]{display:none}
 <body>
 
 <div class="menu">
-  <button class="mbtn amber" id="bCard">Carte</button>
   <div class="spacer"></div>
   <button class="mbtn" id="bTheme" title="Jour / Nuit">☾ Nuit</button>
   <button class="mbtn" id="bSet" title="Paramètres">⚙ Paramètres</button>
@@ -131,7 +130,7 @@ input[type=file]{display:none}
 
 <div class="welcome" id="welcome">
   <h2>Charge ta carte Rekordbox</h2>
-  <p id="welcomeMsg">Insère la carte, puis choisis-la avec le bouton <b>Carte</b>. L'appli lira les playlists et jouera les morceaux en streaming.</p>
+  <p id="welcomeMsg">Ouvre les <b>Paramètres</b> (⚙) et charge une fois tes deux dossiers : d'abord <b>PIONEER</b>, puis <b>Contents</b>. C'est mémorisé — ensuite l'appli lit la carte toute seule.</p>
 </div>
 
 <div class="decks" id="decks" style="display:none"></div>
@@ -141,6 +140,7 @@ input[type=file]{display:none}
 <div class="page" id="setPage">
   <div class="pagehead"><button class="mbtn" id="setBack">← Retour</button><h2>Paramètres</h2></div>
   <div class="pagebody">
+    <div class="setrow col"><span>Carte Rekordbox<br><small>À faire une seule fois : choisis tes deux dossiers. C'est mémorisé, même si tu retires et remets la carte.</small></span><div style="display:flex;flex-direction:column;gap:10px;margin-top:8px"><button class="mbtn amber" id="pickPioneer">1 · Choisir le dossier PIONEER</button><button class="mbtn amber" id="pickContents">2 · Choisir le dossier Contents</button><button class="mbtn" id="resetCard">Réinitialiser la carte</button><div id="cardStatus" style="font-size:12px;color:var(--mut);font-family:var(--mono)"></div></div></div>
     <div class="setrow"><span>Lecteurs affichés</span><div class="seg" id="segCount"><button data-n="1">1</button><button data-n="2">2</button><button data-n="3">3</button></div></div>
     <div class="setrow"><span>Atténuation auto du fond<br><small>baisse le Lecteur 1 quand un ponctuel joue</small></span><label class="sw"><input type="checkbox" id="duckOn" checked><span class="sld"></span></label></div>
     <div class="setrow col"><span>Niveau d'atténuation <b id="duckVal">70%</b></span><input type="range" id="duckLvl" min="0" max="100" value="70"></div>
@@ -193,10 +193,14 @@ async function loadCard(){
     if(!App.lib.tracks.length){ showWelcome("0 morceau — l'export doit être en Device Library (traditionnel)."); return; }
     App.playlists=App.lib.playlists.length?App.lib.playlists:[{name:"Toutes les pistes",path:"",tracks:App.lib.tracks}];
     startDecks();
+    let resolved=0; const sample=App.lib.tracks.slice(0,40);
+    for(const t of sample){ if(findFile(t.filePath)||findFile(t.filename)) resolved++; }
+    setCardStatus(App.lib.tracks.length+" morceaux · audio trouvé "+resolved+"/"+sample.length+(resolved===0?" — ajoute le dossier Contents":""));
     toast(App.lib.tracks.length+" morceaux · "+App.lib.playlists.length+" playlists");
   }catch(e){ showWelcome("Carte non accessible. Choisis-la avec le bouton « Carte »."); console.error(e); }
 }
-function showWelcome(msg){ $('decks').style.display='none'; $('welcome').style.display='flex'; if(msg)$('welcomeMsg').textContent=msg; }
+function showWelcome(msg){ $('decks').style.display='none'; $('welcome').style.display='flex'; if(msg){$('welcomeMsg').textContent=msg; setCardStatus(msg);} }
+function setCardStatus(t){ const el=$('cardStatus'); if(el) el.textContent=t||''; }
 
 /* ---------- decks ---------- */
 const LARR='<svg viewBox="0 0 24 24"><path d="M2 12 L11 4 L11 9 L22 9 L22 15 L11 15 L11 20 Z" fill="currentColor"/></svg>';
@@ -380,8 +384,10 @@ $('pOutRange').oninput=e=>{ App.settings.pFadeOut=+e.target.value; $('pOutVal').
 loadSettings(); applySettingsToUI();
 
 /* ---------- carte ---------- */
-$('bCard').onclick=()=>{ if(window.DK7&&window.DK7.pickCard){ window.DK7.pickCard(); } else { loadCard(); } };
 window.onCardReady=()=>loadCard();   // appelé par le natif après choix du dossier
+$('pickPioneer').onclick=()=>{ if(window.DK7&&DK7.pickCard)DK7.pickCard(); else toast('Disponible dans l\'appli Android'); };
+$('pickContents').onclick=()=>{ if(window.DK7&&DK7.pickCard)DK7.pickCard(); else toast('Disponible dans l\'appli Android'); };
+$('resetCard').onclick=()=>{ if(window.DK7&&DK7.resetCard)DK7.resetCard(); };
 // tentative de chargement auto (si le natif a déjà une carte mémorisée, ou en test)
 loadCard();
 if(location.hash.indexOf('test')>=0) window.__t={App,loadCard,startDecks,setDeckSource,setDeckCount,handleFondMode,getAC};
