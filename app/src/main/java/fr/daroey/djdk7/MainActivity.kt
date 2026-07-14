@@ -4,9 +4,13 @@ import android.content.Context
 import android.content.Intent
 import android.net.Uri
 import android.os.Bundle
+import android.os.Handler
+import android.os.Looper
 import android.os.ParcelFileDescriptor
+import android.view.ViewGroup
 import android.provider.DocumentsContract
 import android.webkit.JavascriptInterface
+import android.webkit.RenderProcessGoneDetail
 import android.webkit.WebResourceRequest
 import android.webkit.WebResourceResponse
 import android.webkit.WebSettings
@@ -17,6 +21,10 @@ import androidx.activity.result.ActivityResultLauncher
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AppCompatActivity
 import androidx.documentfile.provider.DocumentFile
+import androidx.media3.common.MediaItem
+import androidx.media3.common.PlaybackException
+import androidx.media3.common.Player
+import androidx.media3.exoplayer.ExoPlayer
 import org.json.JSONArray
 import org.json.JSONObject
 import java.io.ByteArrayInputStream
@@ -43,6 +51,18 @@ class MainActivity : AppCompatActivity() {
     private var fileCache: MutableMap<String, Uri>? = null
     private var fileList: MutableList<String>? = null
     private lateinit var pickTree: ActivityResultLauncher<Uri?>
+    // --- lecteurs natifs ExoPlayer (un par deck) ---
+    private val players = arrayOfNulls<ExoPlayer>(3)
+    private val posMs = LongArray(3)
+    private val durMs = LongArray(3)
+    private val playingArr = BooleanArray(3)
+    private val ui = Handler(Looper.getMainLooper())
+    private val ticker = object : Runnable {
+        override fun run() {
+            for (i in 0..2) { val p = players[i]; if (p != null) { posMs[i] = p.currentPosition; val d = p.duration; durMs[i] = if (d > 0) d else 0L; playingArr[i] = p.isPlaying } }
+            ui.postDelayed(this, 150)
+        }
+    }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -95,12 +115,46 @@ class MainActivity : AppCompatActivity() {
                     resp("text/plain", 500, "err", ByteArrayInputStream(("" + e.message).toByteArray()), null)
                 }
             }
+            override fun onRenderProcessGone(view: WebView?, detail: RenderProcessGoneDetail?): Boolean {
+                // le moteur de rendu a planté (souvent un fichier trop lourd) : on relance au lieu de fermer l'appli
+                try { (view?.parent as? ViewGroup)?.removeView(view) } catch (_: Exception) {}
+                try { view?.destroy() } catch (_: Exception) {}
+                recreate()
+                return true
+            }
         }
+        for (i in 0..2) {
+            val idx = i
+            val p = ExoPlayer.Builder(this).build()
+            p.addListener(object : Player.Listener {
+                override fun onPlaybackStateChanged(state: Int) {
+                    if (state == Player.STATE_ENDED) web.post { web.evaluateJavascript("window.onNativeEnded && window.onNativeEnded($idx);", null) }
+                }
+                override fun onPlayerError(error: PlaybackException) {
+                    web.post { web.evaluateJavascript("window.onNativeError && window.onNativeError($idx);", null) }
+                }
+            })
+            players[i] = p
+        }
+        ui.post(ticker)
         web.loadUrl("https://dk7.local/index.html")
     }
 
     inner class Bridge {
         @JavascriptInterface fun pickCard() { runOnUiThread { pickTree.launch(null) } }
+        @JavascriptInterface fun load(deck: Int, rel: String) { runOnUiThread {
+            if (fileCache == null) buildCache()
+            val uri = fileCache?.get(rel.lowercase()) ?: return@runOnUiThread
+            val p = players.getOrNull(deck) ?: return@runOnUiThread
+            p.setMediaItem(MediaItem.fromUri(uri)); p.prepare(); p.playWhenReady = false
+        } }
+        @JavascriptInterface fun play(deck: Int) { runOnUiThread { players.getOrNull(deck)?.play() } }
+        @JavascriptInterface fun pause(deck: Int) { runOnUiThread { players.getOrNull(deck)?.pause() } }
+        @JavascriptInterface fun seek(deck: Int, ms: Double) { runOnUiThread { players.getOrNull(deck)?.seekTo(ms.toLong()) } }
+        @JavascriptInterface fun setVolume(deck: Int, v: Double) { runOnUiThread { players.getOrNull(deck)?.volume = v.toFloat() } }
+        @JavascriptInterface fun stop(deck: Int) { runOnUiThread { players.getOrNull(deck)?.let { it.stop(); it.clearMediaItems() } } }
+        @JavascriptInterface fun position(deck: Int): Double = if (deck in 0..2) posMs[deck].toDouble() else 0.0
+        @JavascriptInterface fun duration(deck: Int): Double = if (deck in 0..2) durMs[deck].toDouble() else 0.0
         @JavascriptInterface fun hasCard(): Boolean = trees.isNotEmpty()
         @JavascriptInterface fun resetCard() {
             runOnUiThread {
@@ -250,6 +304,12 @@ class MainActivity : AppCompatActivity() {
         r.setStatusCodeAndReasonPhrase(code, reason)
         if (headers != null) r.responseHeaders = headers
         return r
+    }
+
+    override fun onDestroy() {
+        ui.removeCallbacks(ticker)
+        for (i in 0..2) { players[i]?.release(); players[i] = null }
+        super.onDestroy()
     }
 
     override fun onBackPressed() {
